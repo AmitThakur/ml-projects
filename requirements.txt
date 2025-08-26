@@ -1,0 +1,7 @@
+ einops
+ jupyterlab
+ matplotlib
+ numpy
+ torch
+ torchvision
+ tqdm
