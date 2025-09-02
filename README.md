@@ -16,4 +16,6 @@ pip install -r requirements.txt
 pip freeze > requirements.txt
 ```
 
+## Auto Encoder (AE)
 ## Variational Auto Encoder (VAE)
+## Latent Diffusion Model (LDM)
