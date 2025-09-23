@@ -17,5 +17,8 @@ pip freeze > requirements.txt
 ```
 
 ## Auto Encoder (AE)
+- MNIST
 ## Variational Auto Encoder (VAE)
+- MNIST
 ## Latent Diffusion Model (LDM)
+- Conditional Latent Diffusion on CIFAR-10
