@@ -22,3 +22,6 @@ pip freeze > requirements.txt
 - MNIST
 ## Latent Diffusion Model (LDM)
 - Conditional Latent Diffusion on CIFAR-10
+## Transformer
+- Text translation: german to English
+- ViT: Vision Transformer

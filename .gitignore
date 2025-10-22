@@ -4,6 +4,6 @@ data
 clrun.sh
 **.DS_Store
 **checkpoints
-**samples
+diffusion_models/ldm_celeba/samples
 **runs
 **files
