@@ -6,4 +6,3 @@ clrun.sh
 **checkpoints
 diffusion_models/ldm_celeba/samples
 **runs
-**files
