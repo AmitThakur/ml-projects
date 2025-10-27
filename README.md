@@ -25,3 +25,4 @@ pip freeze > requirements.txt
 ## Transformer
 - Text translation: german to English
 - ViT: Vision Transformer
+- Text Caption Generator for a given image
