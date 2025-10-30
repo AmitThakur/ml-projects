@@ -5,4 +5,8 @@ clrun.sh
 **.DS_Store
 **checkpoints
 diffusion_models/ldm_celeba/samples
-**runs
+**runsclip/files/*.pth
+*.pth
+*.pt
+*.ckpt
+files/*.pth
