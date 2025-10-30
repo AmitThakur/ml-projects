@@ -26,3 +26,6 @@ pip freeze > requirements.txt
 - Text translation: german to English
 - ViT: Vision Transformer
 - Text Caption Generator for a given image
+
+## CLIP
+- Search image using text on Flickr-8K dataset
