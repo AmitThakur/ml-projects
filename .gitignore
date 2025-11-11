@@ -5,6 +5,8 @@ clrun.sh
 **.DS_Store
 **checkpoints
 diffusion_models/ldm_celeba/samples
+clip_ldm/pytorch-stable-diffusion
+diffusion_models/latent-diffusion-model/runs/
 **runsclip/files/*.pth
 *.pth
 *.pt
