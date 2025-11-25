@@ -1,11 +1,6 @@
 import torch
 import torch.nn.functional as F
 
-# ---- Assumptions ----
-# You have a VAE with:
-#   - encode(x) -> Normal(mu, logvar) or (mu, logvar)
-#   - decode(z) -> reconstructed image
-# Replace `vae.encode/vae.decode` to match your API.
 
 @torch.no_grad()
 def vae_mean_latent(vae, x):
@@ -36,7 +31,7 @@ def tangent_edit(z, v, alpha):
     # Put back shape
     return z_prime[0] if z_prime.shape[0] == 1 else z_prime
 
-# ---------- 1) Direction from two images ----------
+
 @torch.no_grad()
 def smile_direction_from_pair(vae, x_neutral, x_smile):
     """
@@ -49,7 +44,7 @@ def smile_direction_from_pair(vae, x_neutral, x_smile):
     v = unit(v)[0]                         # [d]
     return v
 
-# ---------- 2) (Optional) Direction from many pairs ----------
+
 @torch.no_grad()
 def smile_direction_from_pairs(vae, neutral_list, smile_list, batch_size=8, device="cuda"):
     """
@@ -70,7 +65,7 @@ def smile_direction_from_pairs(vae, neutral_list, smile_list, batch_size=8, devi
     v = unit(v)
     return v
 
-# ---------- 3) Apply edit and decode ----------
+
 @torch.no_grad()
 def apply_smile_edit_and_decode(vae, x_input, v, alpha, tangent=True):
     """
@@ -86,14 +81,3 @@ def apply_smile_edit_and_decode(vae, x_input, v, alpha, tangent=True):
     x_prime = vae.decode(z_prime[None, :])  # adapt to your VAE API; should return [1,C,H,W]
     return x_prime, z_prime
 
-# ---------- 4) Example usage ----------
-# vae = ...  # your loaded VAE (to(device).eval())
-# x_neutral = ...  # [1,C,H,W], preprocessed
-# x_smile   = ...  # [1,C,H,W], preprocessed
-# v = smile_direction_from_pair(vae, x_neutral, x_smile)  # [d]
-# # Edit a new face x0 with a sweep of alphas
-# alphas = [-0.6, -0.3, 0.0, 0.3, 0.6]
-# outs = []
-# for a in alphas:
-#     x_out, _ = apply_smile_edit_and_decode(vae, x0, v, alpha=a, tangent=True)
-#     outs.append(x_out)  # visualize in a grid
