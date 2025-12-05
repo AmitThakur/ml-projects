@@ -279,8 +279,7 @@ def decode_vae(vae, z):
     return x
 
 
-
-Label Conditioning: supports hard AND soft labels
+# Label Conditioning: supports hard AND soft labels
 def add_label_channels(z, y, num_classes=NUM_CLASSES):
     """
     z: [B, C, H, W] latent
