@@ -1,5 +1,5 @@
 """
-python train_celeba_ldm_smile.py \
+python celeba_ldm_smile.py \
   --data_root /home/jovyan/data/celeba \
   --out_dir ldm_smile_out \
   --image_size 128 \
@@ -12,6 +12,31 @@ python train_celeba_ldm_smile.py \
   --guidance_scale 2.0 \
   --resume
 
+python celeba_ldm_smile.py \
+  --mode edit \
+  --data_root /home/jovyan/data/celeba \
+  --out_dir ldm_smile_out \
+  --image_size 128 \
+  --num_steps 1000 \
+  --ckpt_path ldm_smile_out/checkpoints/unet_epoch_300.pt \
+  --alphas 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0 \
+  --t_start_ratios 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0 \
+  --edit_image_path pairs/0003_neutral.jpg \
+  --edit_guidance_scale 2.0 \
+  --max_valid_images 500
+
+python celeba_ldm_smile.py \
+  --mode edit \
+  --data_root /home/jovyan/data/celeba \
+  --out_dir ldm_smile_out \
+  --image_size 128 \
+  --num_steps 1000 \
+  --ckpt_path ldm_smile_out/checkpoints/unet_epoch_300.pt \
+  --alphas 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0 \
+  --t_start_ratios 0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8 0.9 1.0 \
+  --edit_guidance_scale 2.0 \
+  --max_valid_images 500
+
 """
 import os
 import math
@@ -21,22 +46,27 @@ from pathlib import Path
 from typing import Tuple
 
 import torch
+import numpy as np
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
 from torchvision.utils import save_image
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from diffusers import AutoencoderKL, UNet2DModel
 
 
-# ---------------------------------------------------------
-# 1. Hyperparameters
-# ---------------------------------------------------------
+
+
+# Hyperparameters / CLI
 def get_args():
     parser = argparse.ArgumentParser()
+
+    parser.add_argument("--mode", type=str, default="train",
+                        choices=["train", "edit"],
+                        help="train: train LDM; edit: run alpha-edit from a checkpoint")
 
     parser.add_argument("--data_root", type=str, required=True,
                         help="Path to CelebA root (folder that contains img_align_celeba etc.)")
@@ -44,7 +74,7 @@ def get_args():
 
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=0)
 
     parser.add_argument("--num_steps", type=int, default=1000, help="Diffusion steps T")
     parser.add_argument("--epochs", type=int, default=20)
@@ -68,6 +98,24 @@ def get_args():
     parser.add_argument("--resume", action="store_true",
                         help="Resume training from latest checkpoint in out_dir/checkpoints")
 
+    # ---- edit-only mode args ----
+    parser.add_argument("--ckpt_path", type=str, default=None,
+                        help="Checkpoint .pt path for --mode edit")
+    parser.add_argument("--alphas", type=float, nargs="+",
+                        default=[0.0, 0.25, 0.5, 0.75, 1.0],
+                        help="Alpha values for label interpolation neutral->smile in edit mode")
+    parser.add_argument("--edit_guidance_scale", type=float, default=2.0,
+                        help="CFG guidance scale to use in edit mode")
+    parser.add_argument(
+        "--t_start_ratios", type=float, nargs="+",
+        default=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+        help="List of t_start_ratio values for t×alpha grid in --mode edit"
+    )
+    parser.add_argument(
+        "--edit_image_path", type=str, default=None,
+        help="Path to input image to edit in --mode edit. If not set, use random neutral val image."
+    )
+
     args = parser.parse_args()
     return args
 
@@ -78,9 +126,7 @@ VAE_SCALE_FACTOR = 0.18215  # SD-style scaling
 NUM_CLASSES = 3  # neutral, smiling, null
 
 
-# ---------------------------------------------------------
-# 2. Diffusion schedule helper
-# ---------------------------------------------------------
+
 class DiffusionSchedule:
     def __init__(self, num_steps, beta_start=1e-4, beta_end=0.02, device="cpu"):
         self.num_steps = num_steps
@@ -106,11 +152,9 @@ class DiffusionSchedule:
                 setattr(self, name, value.to(device))
 
 
-# ---------------------------------------------------------
-# 3. Offline CelebA smiling dataset wrapper
-# ---------------------------------------------------------
 class CelebASmile(Dataset):
     """
+    Using it in case gdown is not working for Pytorch dataset download.
     Offline CelebA reader.
     - Reads img_align_celeba, list_attr_celeba.txt, list_eval_partition.txt
     - split ∈ {"train","valid","test"} mapped via partition file (0,1,2)
@@ -204,9 +248,6 @@ class CelebASmile(Dataset):
         return img, label
 
 
-# ---------------------------------------------------------
-# 4. Helper: VAE encode/decode
-# ---------------------------------------------------------
 @torch.no_grad()
 def encode_vae(vae, x):
     """
@@ -238,25 +279,30 @@ def decode_vae(vae, z):
     return x
 
 
-# ---------------------------------------------------------
-# 5. Conditioning helper: add label as extra channels
-# ---------------------------------------------------------
+
+Label Conditioning: supports hard AND soft labels
 def add_label_channels(z, y, num_classes=NUM_CLASSES):
     """
     z: [B, C, H, W] latent
-    y: [B] int labels in [0, num_classes-1]
-    Returns: [B, C+num_classes, H, W] with one-hot label broadcast over spatial dims.
+    y:
+      - either [B] int labels in [0, num_classes-1]
+      - or [B, num_classes] float soft labels (e.g. interpolated neutral/smile)
+    Returns: [B, C+num_classes, H, W]
     """
     B, C, H, W = z.shape
-    y_onehot = F.one_hot(y, num_classes=num_classes).float()  # [B, num_classes]
+
+    if y.dim() == 1:  # integer labels
+        y_onehot = F.one_hot(y, num_classes=num_classes).float()  # [B, num_classes]
+    else:
+        y_onehot = y.float()  # assume already [B, num_classes]
+
     y_onehot = y_onehot.view(B, num_classes, 1, 1).expand(B, num_classes, H, W)
     z_in = torch.cat([z, y_onehot], dim=1)
     return z_in
 
 
-# ---------------------------------------------------------
-# 6. Sampling: from noise (class-conditional) with CFG
-# ---------------------------------------------------------
+
+# Sampling: from noise (class-conditional) with CFG
 @torch.no_grad()
 def sample_ldm(unet, schedule, vae, num_samples, label, guidance_scale,
                latent_shape, device):
@@ -302,43 +348,60 @@ def sample_ldm(unet, schedule, vae, num_samples, label, guidance_scale,
     return x_img
 
 
-# ---------------------------------------------------------
-# 7. Editing: neutral image -> smiling
-# (your current version with t_start_ratio and smaller guidance in call)
-# ---------------------------------------------------------
+
+# Editing: alpha interpolation on class label
 @torch.no_grad()
-def edit_smile(unet, schedule, vae, x_neutral, guidance_scale, device,
-               t_start_ratio=0.5):
+def edit_smile_alpha(unet, schedule, vae, x_neutral, alphas,
+                     guidance_scale, device, t_start_ratio=0.5):
     """
-    x_neutral: [B,3,H,W] in [-1,1]
-    t_start_ratio: fraction of the diffusion chain to start from (0<r<=1).
-    Returns smiling images [B,3,H,W] in [0,1].
+    Edit a neutral image into varying degrees of smile via alpha interpolation in label space.
+
+    x_neutral: [1,3,H,W] in [-1,1]
+    alphas:    list or 1D tensor of values in [0,1], e.g. [0.0, 0.25, 0.5, 0.75, 1.0]
+    guidance_scale: CFG scale for editing
+    t_start_ratio: fraction of diffusion chain to start from (0<r<=1)
+
+    Returns: [len(alphas), 3, H, W] images in [0,1]
     """
     unet.eval()
     vae.eval()
 
-    z0 = encode_vae(vae, x_neutral.to(device))   # [B,4,h,w]
-    B, C, H, W = z0.shape
-    T = schedule.num_steps
+    if isinstance(alphas, list):
+        alphas = torch.tensor(alphas, dtype=torch.float32, device=device)
+    else:
+        alphas = alphas.to(device).float()
 
+    num_alpha = alphas.shape[0]
+
+    # encode once, replicate for each alpha
+    z0_single = encode_vae(vae, x_neutral.to(device))  # [1,4,h,w]
+    _, C, H, W = z0_single.shape
+    z0 = z0_single.expand(num_alpha, C, H, W).clone()  # [A,4,h,w]
+
+    T = schedule.num_steps
     t_start = max(1, int(t_start_ratio * (T - 1)))
     alpha_bar_t = schedule.alphas_cumprod[t_start]
 
     eps = torch.randn_like(z0)
-    z_t = math.sqrt(alpha_bar_t) * z0 + math.sqrt(1.0 - alpha_bar_t) * eps
+    z_t = math.sqrt(alpha_bar_t) * z0 + math.sqrt(1.0 - alpha_bar_t) * eps  # [A,4,h,w]
 
-    y_smile = torch.full((B,), 1, device=device, dtype=torch.long)
-    y_null = torch.full((B,), 2, device=device, dtype=torch.long)
+    # soft labels between neutral (index 0) and smile (index 1)
+    y_soft = torch.zeros(num_alpha, NUM_CLASSES, device=device)  # [A,3]
+    y_soft[:, 0] = 1.0 - alphas
+    y_soft[:, 1] = alphas
+    # y_soft[:, 2] = 0
 
-    for t_step in tqdm(reversed(range(t_start + 1)), desc="Smile editing", leave=False):
-        t = torch.full((B,), t_step, device=device, dtype=torch.long)
+    y_null = torch.full((num_alpha,), 2, device=device, dtype=torch.long)
+
+    for t_step in tqdm(reversed(range(t_start + 1)), desc="Smile alpha editing", leave=False):
+        t = torch.full((num_alpha,), t_step, device=device, dtype=torch.long)
 
         z_uncond_in = add_label_channels(z_t, y_null)
-        z_cond_in = add_label_channels(z_t, y_smile)
+        z_cond_in   = add_label_channels(z_t, y_soft)
 
         eps_uncond = unet(z_uncond_in, t).sample
-        eps_cond = unet(z_cond_in, t).sample
-        eps_hat = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+        eps_cond   = unet(z_cond_in, t).sample
+        eps_hat    = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
 
         beta_t = schedule.betas[t_step]
         alpha_t = schedule.alphas[t_step]
@@ -353,13 +416,10 @@ def edit_smile(unet, schedule, vae, x_neutral, guidance_scale, device,
             sigma_t = torch.sqrt(schedule.posterior_variance[t_step])
             z_t = z_t + sigma_t * noise
 
-    x_smile = decode_vae(vae, z_t)  # [B,3,H,W] in [0,1]
-    return x_smile
+    x_edits = decode_vae(vae, z_t)  # [A,3,H,W] in [0,1]
+    return x_edits
 
 
-# ---------------------------------------------------------
-# 8. Plot loss curve
-# ---------------------------------------------------------
 def plot_losses(losses, out_path):
     epochs = list(range(1, len(losses) + 1))
     plt.figure()
@@ -373,21 +433,18 @@ def plot_losses(losses, out_path):
     plt.close()
 
 
-# ---------------------------------------------------------
-# 9. Main training loop (with resume)
-# ---------------------------------------------------------
-def main():
-    args = get_args()
+
+def run_train(args):
     print("Using device:", DEVICE)
 
     out_dir = Path(args.out_dir)
     ckpt_dir = out_dir / "checkpoints"
-    (ckpt_dir).mkdir(parents=True, exist_ok=True)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "samples").mkdir(parents=True, exist_ok=True)
     (out_dir / "edits").mkdir(parents=True, exist_ok=True)
     (out_dir / "plots").mkdir(parents=True, exist_ok=True)
 
-    # 9.1 Datasets + subset limiting (offline CelebA)
+    # datasets
     train_set_full = CelebASmile(args.data_root, split="train", image_size=args.image_size)
     valid_set_full = CelebASmile(args.data_root, split="valid", image_size=args.image_size)
 
@@ -413,12 +470,8 @@ def main():
         train_set, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=True
     )
-    valid_loader = DataLoader(
-        valid_set, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True
-    )
 
-    # 9.2 VAE (frozen)
+    # VAE
     print("Loading pretrained VAE...")
     vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse")
     vae.to(DEVICE)
@@ -426,16 +479,16 @@ def main():
     for p in vae.parameters():
         p.requires_grad = False
 
-    # 9.3 UNet in latent space (label-as-channel conditional)
-    sample_size = args.image_size // 8  # VAE downsampling factor 8
-    print("Sample (latent) spatial size:", sample_size)
+    # UNet
+    sample_size = args.image_size // 8
+    print("Latent spatial size:", sample_size)
 
     unet = UNet2DModel(
         sample_size=sample_size,
-        in_channels=LATENT_CHANNELS + NUM_CLASSES,  # 4 latent + 3 label channels
+        in_channels=LATENT_CHANNELS + NUM_CLASSES,
         out_channels=LATENT_CHANNELS,
         layers_per_block=2,
-        block_out_channels=(256, 512, 512),  # tweak if you want bigger model
+        block_out_channels=(256, 512, 512),
         down_block_types=("DownBlock2D", "DownBlock2D", "DownBlock2D"),
         up_block_types=("UpBlock2D", "UpBlock2D", "UpBlock2D"),
     )
@@ -443,7 +496,6 @@ def main():
 
     optimizer = torch.optim.AdamW(unet.parameters(), lr=args.lr)
 
-    # 9.4 Diffusion schedule
     schedule = DiffusionSchedule(
         num_steps=args.num_steps,
         beta_start=args.beta_start,
@@ -451,31 +503,29 @@ def main():
         device=DEVICE
     )
 
-    # 9.5 Resume logic
+    # resume
     start_epoch = 1
     epoch_losses = []
-
     if args.resume:
         ckpts = sorted(ckpt_dir.glob("unet_epoch_*.pt"))
-        if len(ckpts) == 0:
-            print(f"[RESUME] No checkpoints found in {ckpt_dir}, starting from scratch.")
-        else:
-            latest_ckpt_path = ckpts[-1]
-            print(f"[RESUME] Loading checkpoint: {latest_ckpt_path}")
-            ckpt = torch.load(latest_ckpt_path, map_location=DEVICE)
-
+        if ckpts:
+            latest = ckpts[-1]
+            print(f"[RESUME] loading {latest}")
+            ckpt = torch.load(latest, map_location=DEVICE)
             unet.load_state_dict(ckpt["model"])
             optimizer.load_state_dict(ckpt["optimizer"])
             epoch_losses = ckpt.get("losses", [])
             last_epoch = ckpt.get("epoch", 0)
             start_epoch = last_epoch + 1
-            print(f"[RESUME] Last epoch = {last_epoch}, resuming from epoch {start_epoch}")
+            print(f"[RESUME] last epoch {last_epoch} -> start {start_epoch}")
+        else:
+            print("[RESUME] no checkpoints found, starting from scratch")
 
     if start_epoch > args.epochs:
-        print(f"start_epoch ({start_epoch}) > args.epochs ({args.epochs}). Nothing to train.")
+        print(f"start_epoch ({start_epoch}) > epochs ({args.epochs}); nothing to train.")
         return
 
-    # 9.6 Training
+    # training loop
     for epoch in range(start_epoch, args.epochs + 1):
         unet.train()
         running_loss = 0.0
@@ -522,52 +572,39 @@ def main():
 
         # Save checkpoint
         ckpt_path = ckpt_dir / f"unet_epoch_{epoch:03d}.pt"
-        torch.save({
-            "epoch": epoch,
-            "model": unet.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "losses": epoch_losses,
-        }, ckpt_path)
+        torch.save(
+            dict(epoch=epoch, model=unet.state_dict(),
+                 optimizer=optimizer.state_dict(), losses=epoch_losses),
+            ckpt_path
+        )
 
-        # Plot loss curve
-        plot_path = out_dir / "plots" / "train_loss.png"
-        plot_losses(epoch_losses, plot_path)
+        plot_losses(epoch_losses, out_dir / "plots" / "train_loss.png")
 
-        # -------------------------------------------------
-        # Sampling at this epoch (from pure noise)
-        # -------------------------------------------------
+        # sampling
         unet.eval()
         with torch.no_grad():
-            num_samples = args.num_sample_images
             latent_shape = (LATENT_CHANNELS, sample_size, sample_size)
+            n_samples = args.num_sample_images
 
-            imgs_neutral = sample_ldm(
-                unet, schedule, vae,
-                num_samples=num_samples,
-                label=0,
-                guidance_scale=args.guidance_scale,
-                latent_shape=latent_shape,
-                device=DEVICE
-            )
-
-            imgs_smile = sample_ldm(
-                unet, schedule, vae,
-                num_samples=num_samples,
-                label=1,
-                guidance_scale=args.guidance_scale,
-                latent_shape=latent_shape,
-                device=DEVICE
-            )
+            imgs_neutral = sample_ldm(unet, schedule, vae,
+                                      num_samples=n_samples, label=0,
+                                      guidance_scale=args.guidance_scale,
+                                      latent_shape=latent_shape, device=DEVICE)
+            imgs_smile = sample_ldm(unet, schedule, vae,
+                                    num_samples=n_samples, label=1,
+                                    guidance_scale=args.guidance_scale,
+                                    latent_shape=latent_shape, device=DEVICE)
 
             # stack [neutral ; smiling]
             grid = torch.cat([imgs_neutral, imgs_smile], dim=0)
             sample_path = out_dir / "samples" / f"samples_epoch_{epoch:03d}.png"
-            save_image(grid, sample_path, nrow=num_samples, padding=2)
+            save_image(grid, sample_path, nrow=n_samples, padding=2)
 
-        # -------------------------------------------------
-        # Edit step: single random neutral image from validation
-        # -------------------------------------------------
-        print("Running edit_smile on a random neutral validation image...")
+        # alpha-edit preview (same as before but inside training)
+        print("Running alpha edit preview on random neutral val image...")
+        valid_set = valid_set_full if args.max_valid_images <= 0 else Subset(
+            valid_set_full, list(range(min(args.max_valid_images, len(valid_set_full))))
+        )
 
         found = False
         for _ in tqdm(range(50), desc="Searching neutral val image", leave=False):
@@ -577,29 +614,196 @@ def main():
                 found = True
                 break
 
-        if not found:
-            print("Warning: could not find neutral image in validation subset for editing.")
-        else:
-            x_neutral = x_val.unsqueeze(0).to(DEVICE)  # [1,3,H,W] in [-1,1]
-
-            x_smiling = edit_smile(
+        if found:
+            x_neutral = x_val.unsqueeze(0).to(DEVICE)
+            alphas = [0.0, 0.25, 0.5, 0.75, 1.0]
+            x_edits = edit_smile_alpha(
                 unet, schedule, vae,
-                x_neutral=x_neutral,
-                guidance_scale=min(args.guidance_scale, 2.0),  # e.g. softer for editing
-                device=DEVICE,
-                t_start_ratio=0.25,
-            )  # [1,3,H,W] in [0,1]
-
-            # original neutral in [0,1] for visualization
-            x_neutral_vis = (x_neutral.clamp(-1, 1) + 1) / 2.0  # [1,3,H,W]
-
-            # side-by-side: [original, edited]
-            comparison = torch.cat([x_neutral_vis, x_smiling], dim=0)
-            edit_path = out_dir / "edits" / f"edit_epoch_{epoch:03d}.png"
-            save_image(comparison, edit_path, nrow=2, padding=2)
+                x_neutral=x_neutral, alphas=alphas,
+                guidance_scale=min(args.guidance_scale, 2.0),
+                device=DEVICE, t_start_ratio=0.5
+            )
+            x_neutral_vis = (x_neutral.clamp(-1, 1) + 1) / 2.0
+            comparison = torch.cat([x_neutral_vis, x_edits], dim=0)
+            save_image(comparison, out_dir / "edits" / f"edit_epoch_{epoch:03d}.png",
+                       nrow=len(alphas) + 1, padding=2)
+        else:
+            print("Warning: no neutral val image found for preview.")
 
     print("Training complete.")
 
 
+def run_edit_only(args):
+    print("Edit-only mode (t_start_ratio × alpha grid). Device:", DEVICE)
+
+    if args.ckpt_path is None:
+        raise ValueError("--ckpt_path must be provided in --mode edit")
+
+    out_dir = Path(args.out_dir)
+    (out_dir / "edits").mkdir(parents=True, exist_ok=True)
+
+    # Load VAE
+    print("Loading pretrained VAE...")
+    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse")
+    vae.to(DEVICE)
+    vae.eval()
+    for p in vae.parameters():
+        p.requires_grad = False
+
+    # Load UNET checkpoint
+    sample_size = args.image_size // 8
+    unet = UNet2DModel(
+        sample_size=sample_size,
+        in_channels=LATENT_CHANNELS + NUM_CLASSES,
+        out_channels=LATENT_CHANNELS,
+        layers_per_block=2,
+        block_out_channels=(256, 512, 512),  # match your training config
+        down_block_types=("DownBlock2D", "DownBlock2D", "DownBlock2D"),
+        up_block_types=("UpBlock2D", "UpBlock2D", "UpBlock2D"),
+    )
+    unet.to(DEVICE)
+
+    print(f"Loading checkpoint: {args.ckpt_path}")
+    ckpt = torch.load(args.ckpt_path, map_location=DEVICE)
+    unet.load_state_dict(ckpt["model"])
+    unet.eval()
+
+    schedule = DiffusionSchedule(
+        num_steps=args.num_steps,
+        beta_start=args.beta_start,
+        beta_end=args.beta_end,
+        device=DEVICE
+    )
+
+
+
+    # Obtain neutral image: user-supplied path OR random neutral from CelebA-valid
+    if args.edit_image_path is not None:
+        # ---- use user supplied image ----
+        print(f"Using user-supplied image: {args.edit_image_path}")
+        img = Image.open(args.edit_image_path).convert("RGB")
+
+        transform = transforms.Compose([
+            transforms.Resize(args.image_size),
+            transforms.CenterCrop(args.image_size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5, 0.5, 0.5],
+                                 [0.5, 0.5, 0.5]),  # -> [-1,1]
+        ])
+        x_neutral = transform(img).unsqueeze(0).to(DEVICE)  # [1,3,H,W] in [-1,1]
+
+    else:
+        # ---- fall back to random neutral from CelebA valid ----
+        print("Selecting random neutral validation image from CelebA...")
+
+        valid_set_full = CelebASmile(args.data_root, split="valid", image_size=args.image_size)
+        if args.max_valid_images > 0:
+            n_valid = min(args.max_valid_images, len(valid_set_full))
+            valid_set = Subset(valid_set_full, list(range(n_valid)))
+            print(f"Using {n_valid}/{len(valid_set_full)} validation images.")
+        else:
+            valid_set = valid_set_full
+            print(f"Using all {len(valid_set_full)} validation images.")
+
+        found = False
+        for _ in range(200):
+            idx = random.randint(0, len(valid_set) - 1)
+            x_val, y_val = valid_set[idx]
+            if y_val == 0:
+                found = True
+                break
+
+        if not found:
+            raise RuntimeError("Could not find neutral image in validation subset.")
+
+        x_neutral = x_val.unsqueeze(0).to(DEVICE)  # [1,3,H,W] in [-1,1]
+
+    # x_neutral is now [1,3,H,W] in [-1,1]
+    x_neutral_vis = (x_neutral.clamp(-1, 1) + 1) / 2.0  # [1,3,H,W] in [0,1]
+
+    alphas = args.alphas
+    t_list = args.t_start_ratios
+    print(f"Using t_start_ratios = {t_list}, alphas = {alphas}")
+
+
+    # Run Edits for each (t_start, alpha)
+    rows_imgs = []  # list of [num_cols,3,H,W]
+    for t_ratio in t_list:
+        print(f"  Editing row for t_start_ratio = {t_ratio} ...")
+        x_edits = edit_smile_alpha(
+            unet, schedule, vae,
+            x_neutral=x_neutral,
+            alphas=alphas,
+            guidance_scale=args.edit_guidance_scale,
+            device=DEVICE,
+            t_start_ratio=t_ratio,
+        )  # [A,3,H,W] in [0,1]
+
+        row_imgs = torch.cat([x_neutral_vis, x_edits], dim=0)  # [K+1,3,H,W]
+        rows_imgs.append(row_imgs)
+
+
+    # Build grid
+    try:
+        font = ImageFont.truetype("arial.ttf", size=18)
+    except:
+        font = ImageFont.load_default()
+
+    num_rows = len(t_list)
+    num_cols = len(alphas) + 1  # neutral + edits
+    H = args.image_size
+    W = args.image_size
+
+    label_h = 30   # top label height
+    label_w = 90   # left label width
+
+    canvas_w = label_w + num_cols * W
+    canvas_h = label_h + num_rows * H
+
+    canvas = Image.new("RGB", (canvas_w, canvas_h), color=(255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+
+    # Column labels
+    col_x0 = label_w
+    draw.text((col_x0 + W // 2 - 35, 5), "neutral", fill=(0, 0, 0), font=font)
+    for j, a in enumerate(alphas):
+        col_x = label_w + (j + 1) * W
+        label = f"alpha={a:.2f}"
+        draw.text((col_x + W // 2 - 35, 5), label, fill=(0, 0, 0), font=font)
+
+    # Row labels
+    for i, t_ratio in enumerate(t_list):
+        row_y = label_h + i * H + H // 2 - 10
+        label = f"t={t_ratio:.2f} T"
+        draw.text((5, row_y), label, fill=(0, 0, 0), font=font)
+
+    # Paste grid images
+    for i in range(num_rows):
+        row_imgs = rows_imgs[i]  # [num_cols,3,H,W]
+        for j in range(num_cols):
+            img_t = row_imgs[j].cpu().permute(1, 2, 0).numpy()
+            img_t = (img_t * 255).clip(0, 255).astype(np.uint8)
+            pil_img = Image.fromarray(img_t)
+            x = label_w + j * W
+            y = label_h + i * H
+            canvas.paste(pil_img, (x, y))
+
+    # Save result
+    ckpt_name = Path(args.ckpt_path).stem
+    base = f"edit_grid_t_alpha_{ckpt_name}"
+    if args.edit_image_path is not None:
+        base += "_custom"
+
+    out_path = out_dir / "edits" / f"{base}.png"
+    canvas.save(out_path)
+    print(f"Saved t_start_ratio × alpha grid to:\n{out_path}")
+
+
+
 if __name__ == "__main__":
-    main()
+    args = get_args()
+    if args.mode == "train":
+        run_train(args)
+    else:  # edit
+        run_edit_only(args)
+
